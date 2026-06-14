@@ -13,6 +13,8 @@
 #include <signal.h>
 #include <stdatomic.h>
 #include <execinfo.h>
+#include <stdint.h>
+#include <time.h>
 
 #include <cuda_runtime.h>
 #include <cuda.h>
@@ -24,19 +26,22 @@
  * Build:
  *   gcc -shared -fPIC -O2 \
  *     -I/usr/local/cuda/include \
- *     cuda_vram_ipc_hook_fixed_v3.c \
- *     -o libcuda_vram_ipc_hook.so \
+ *     cuda-llm-weight-share.c \
+ *     -o cuda-llm-weight-share.so \
  *     -ldl
  *
  * Usage example:
  *   export MODEL_SIZE=49392123904
  *   export CUDA_VRAM_IPC_NAME="/cuda_vram_ipc_qwen3_30b_gpu0"
- *   LD_PRELOAD=/path/libcuda_vram_ipc_hook.so ./llama-server ...
+ *   LD_PRELOAD=/path/cuda-llm-weight-share.so ./llama-server ...
  *
  * Optional:
  *   export MODEL_SIZE_TOLERANCE=1048576
  *   export CUDA_VRAM_IPC_SHM_SIZE_WAIT_SEC=10
  *   export CUDA_VRAM_IPC_SUPPRESS_MASTER_FREE=1
+ *   export CUDA_VRAM_IPC_SKIP_WORKER_WEIGHT_UPLOADS=1
+ *   export CUDA_VRAM_IPC_LOG_SKIPPED_UPLOADS=0
+ *   export CUDA_VRAM_IPC_LOG_MEMCPY_OPS=0
  *
  * Notes:
  * - This intentionally hooks only cudaMalloc/cudaFree.
@@ -65,6 +70,10 @@ static cudaError_t (*real_cudaFree)(void *) = NULL;
 static cudaError_t (*real_cudaIpcGetMemHandle)(cudaIpcMemHandle_t *, void *) = NULL;
 static cudaError_t (*real_cudaIpcOpenMemHandle)(void **, cudaIpcMemHandle_t, unsigned int) = NULL;
 static cudaError_t (*real_cudaIpcCloseMemHandle)(void *) = NULL;
+static cudaError_t (*real_cudaMemcpy)(void *, const void *, size_t, enum cudaMemcpyKind) = NULL;
+static cudaError_t (*real_cudaMemcpyAsync)(void *, const void *, size_t, enum cudaMemcpyKind, cudaStream_t) = NULL;
+static cudaError_t (*real_cudaMemset)(void *, int, size_t) = NULL;
+static cudaError_t (*real_cudaMemsetAsync)(void *, int, size_t, cudaStream_t) = NULL;
 
 /* dlopen handle for libcudart when RTLD_NEXT cannot see it */
 static void *cudart_handle = NULL;
@@ -77,13 +86,18 @@ static int shm_size_wait_sec = 10;
 static bool suppress_master_free = false;
 static bool trace_callers = false;
 static bool trace_normal_allocs = false;
+static bool skip_worker_weight_uploads = true;
+static bool log_memcpy_ops = false;
+static bool log_skipped_weight_uploads = false;
 static int trace_depth = 8;
 
 /* Per-process state */
 static bool shared_allocation_done = false;
 static bool is_master_process = false;
 static void *master_alloc_ptr = NULL;
+static size_t master_alloc_size = 0;
 static void *worker_mapped_ptr = NULL;
+static size_t worker_mapped_size = 0;
 
 /* Avoid accidental resolver recursion */
 static __thread int in_hook = 0;
@@ -137,6 +151,14 @@ static void read_config_from_env(void) {
     trace_callers = env_is_true(getenv("CUDA_VRAM_IPC_TRACE_CALLERS"));
     trace_normal_allocs = env_is_true(getenv("CUDA_VRAM_IPC_TRACE_NORMAL_ALLOCS"));
 
+    const char *env_skip_uploads = getenv("CUDA_VRAM_IPC_SKIP_WORKER_WEIGHT_UPLOADS");
+    if (env_skip_uploads && env_skip_uploads[0]) {
+        skip_worker_weight_uploads = env_is_true(env_skip_uploads);
+    }
+
+    log_memcpy_ops = env_is_true(getenv("CUDA_VRAM_IPC_LOG_MEMCPY_OPS"));
+    log_skipped_weight_uploads = env_is_true(getenv("CUDA_VRAM_IPC_LOG_SKIPPED_UPLOADS"));
+
     const char *env_trace_depth = getenv("CUDA_VRAM_IPC_TRACE_DEPTH");
     if (env_trace_depth && env_trace_depth[0]) {
         errno = 0;
@@ -154,7 +176,8 @@ static void setup_hooks(void) {
     fprintf(stderr,
             "[VRAM_HOOK] loaded. MODEL_SIZE=%zu, TOLERANCE=%zu, SHM=%s, "
             "SHM_SIZE_WAIT_SEC=%d, SUPPRESS_MASTER_FREE=%d, "
-            "TRACE_CALLERS=%d, TRACE_NORMAL_ALLOCS=%d, TRACE_DEPTH=%d\n",
+            "TRACE_CALLERS=%d, TRACE_NORMAL_ALLOCS=%d, TRACE_DEPTH=%d, "
+            "SKIP_WORKER_WEIGHT_UPLOADS=%d, LOG_MEMCPY_OPS=%d, LOG_SKIPPED_UPLOADS=%d\n",
             target_shared_size,
             target_size_tolerance,
             shm_name,
@@ -162,7 +185,10 @@ static void setup_hooks(void) {
             suppress_master_free ? 1 : 0,
             trace_callers ? 1 : 0,
             trace_normal_allocs ? 1 : 0,
-            trace_depth);
+            trace_depth,
+            skip_worker_weight_uploads ? 1 : 0,
+            log_memcpy_ops ? 1 : 0,
+            log_skipped_weight_uploads ? 1 : 0);
 }
 
 
@@ -265,6 +291,64 @@ static void trace_cuda_free_caller(const char *api_name, void *ptr, cudaError_t 
     }
 }
 
+
+static long long now_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+
+    return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+}
+
+static bool ptr_range_in_range(const void *ptr, size_t count, const void *base_ptr, size_t range_size) {
+    if (!ptr || !base_ptr || range_size == 0) {
+        return false;
+    }
+
+    uintptr_t p = (uintptr_t)ptr;
+    uintptr_t base = (uintptr_t)base_ptr;
+    uintptr_t end = base + range_size;
+
+    if (end < base) {
+        return false;
+    }
+
+    if (p < base || p >= end) {
+        return false;
+    }
+
+    if (count == 0) {
+        return true;
+    }
+
+    uintptr_t p_end = p + count;
+    if (p_end < p) {
+        return false;
+    }
+
+    return p_end <= end;
+}
+
+static bool ptr_in_worker_shared_range(const void *ptr, size_t count) {
+    return ptr_range_in_range(ptr, count, worker_mapped_ptr, worker_mapped_size);
+}
+
+static bool ptr_in_master_shared_range(const void *ptr, size_t count) {
+    return ptr_range_in_range(ptr, count, master_alloc_ptr, master_alloc_size);
+}
+
+static const char *cuda_memcpy_kind_name(enum cudaMemcpyKind kind) {
+    switch (kind) {
+        case cudaMemcpyHostToHost: return "HostToHost";
+        case cudaMemcpyHostToDevice: return "HostToDevice";
+        case cudaMemcpyDeviceToHost: return "DeviceToHost";
+        case cudaMemcpyDeviceToDevice: return "DeviceToDevice";
+        case cudaMemcpyDefault: return "Default";
+        default: return "Unknown";
+    }
+}
+
 static bool size_matches_target(size_t size) {
     if (target_shared_size == 0) {
         return false;
@@ -308,6 +392,22 @@ static int resolve_from_handle(void *handle) {
     if (!real_cudaIpcCloseMemHandle) {
         real_cudaIpcCloseMemHandle =
             (cudaError_t (*)(void *))dlsym(handle, "cudaIpcCloseMemHandle");
+    }
+    if (!real_cudaMemcpy) {
+        real_cudaMemcpy =
+            (cudaError_t (*)(void *, const void *, size_t, enum cudaMemcpyKind))dlsym(handle, "cudaMemcpy");
+    }
+    if (!real_cudaMemcpyAsync) {
+        real_cudaMemcpyAsync =
+            (cudaError_t (*)(void *, const void *, size_t, enum cudaMemcpyKind, cudaStream_t))dlsym(handle, "cudaMemcpyAsync");
+    }
+    if (!real_cudaMemset) {
+        real_cudaMemset =
+            (cudaError_t (*)(void *, int, size_t))dlsym(handle, "cudaMemset");
+    }
+    if (!real_cudaMemsetAsync) {
+        real_cudaMemsetAsync =
+            (cudaError_t (*)(void *, int, size_t, cudaStream_t))dlsym(handle, "cudaMemsetAsync");
     }
 
     return 0;
@@ -370,12 +470,17 @@ static int resolve_cuda_symbols(void) {
         fprintf(stderr,
                 "[VRAM_HOOK] ERROR: failed to resolve CUDA symbols: "
                 "cudaMalloc=%p cudaFree=%p cudaIpcGetMemHandle=%p "
-                "cudaIpcOpenMemHandle=%p cudaIpcCloseMemHandle=%p\n",
+                "cudaIpcOpenMemHandle=%p cudaIpcCloseMemHandle=%p "
+                "cudaMemcpy=%p cudaMemcpyAsync=%p cudaMemset=%p cudaMemsetAsync=%p\n",
                 (void *)real_cudaMalloc,
                 (void *)real_cudaFree,
                 (void *)real_cudaIpcGetMemHandle,
                 (void *)real_cudaIpcOpenMemHandle,
-                (void *)real_cudaIpcCloseMemHandle);
+                (void *)real_cudaIpcCloseMemHandle,
+                (void *)real_cudaMemcpy,
+                (void *)real_cudaMemcpyAsync,
+                (void *)real_cudaMemset,
+                (void *)real_cudaMemsetAsync);
         return -1;
     }
 
@@ -492,13 +597,19 @@ cudaError_t cudaFree(void *devPtr) {
                 "[VRAM_HOOK] cudaFree for worker IPC pointer %p -> cudaIpcCloseMemHandle\n",
                 devPtr);
 
+        long long t0 = now_ms();
         cudaError_t res = real_cudaIpcCloseMemHandle(devPtr);
+        long long t1 = now_ms();
+
         fprintf(stderr,
-                "[VRAM_HOOK] worker cudaIpcCloseMemHandle returned code=%d\n",
-                (int)res);
+                "[VRAM_HOOK] WORKER cudaIpcCloseMemHandle done for shared weights ptr=%p code=%d elapsed=%lld ms\n",
+                devPtr,
+                (int)res,
+                t1 - t0);
         trace_cuda_free_caller("cudaFree(worker-ipc-close)", devPtr, res);
 
         worker_mapped_ptr = NULL;
+        worker_mapped_size = 0;
         shared_allocation_done = false;
 
         in_hook = 0;
@@ -514,6 +625,7 @@ cudaError_t cudaFree(void *devPtr) {
 
         shm_unlink(shm_name);
         master_alloc_ptr = NULL;
+        master_alloc_size = 0;
         is_master_process = false;
         shared_allocation_done = false;
 
@@ -528,11 +640,15 @@ cudaError_t cudaFree(void *devPtr) {
             return cudaSuccess;
         }
 
+        long long t0 = now_ms();
         cudaError_t res = real_cudaFree(devPtr);
+        long long t1 = now_ms();
 
         fprintf(stderr,
-                "[VRAM_HOOK] MASTER real_cudaFree returned code=%d\n",
-                (int)res);
+                "[VRAM_HOOK] MASTER real_cudaFree done for shared weights ptr=%p code=%d elapsed=%lld ms\n",
+                devPtr,
+                (int)res,
+                t1 - t0);
 
         trace_cuda_free_caller("cudaFree(master-exported)", devPtr, res);
 
@@ -572,19 +688,28 @@ cudaError_t cudaMalloc(void **devPtr, size_t size) {
      * Everything else remains normal: KV cache, scratch buffers, CUDA graphs, etc.
      */
     if (shared_allocation_done || !size_matches_target(size)) {
+        fprintf(stderr,
+                "[VRAM_HOOK] cudaMalloc normal request: %.2f MB (%zu bytes)\n",
+                (double)size / (1024.0 * 1024.0),
+                size);
+
+        long long t0 = now_ms();
         cudaError_t res = real_cudaMalloc(devPtr, size);
+        long long t1 = now_ms();
 
         if (res == cudaSuccess) {
             fprintf(stderr,
-                    "[VRAM_HOOK] cudaMalloc normal: %.2f MB (%zu bytes) at %p\n",
+                    "[VRAM_HOOK] cudaMalloc normal done: %.2f MB (%zu bytes) at %p, elapsed=%lld ms\n",
                     (double)size / (1024.0 * 1024.0),
                     size,
-                    *devPtr);
+                    *devPtr,
+                    t1 - t0);
         } else {
             fprintf(stderr,
-                    "[VRAM_HOOK] cudaMalloc normal failed: size=%zu code=%d\n",
+                    "[VRAM_HOOK] cudaMalloc normal failed: size=%zu code=%d elapsed=%lld ms\n",
                     size,
-                    (int)res);
+                    (int)res,
+                    t1 - t0);
         }
 
         if (trace_normal_allocs) {
@@ -635,11 +760,20 @@ cudaError_t cudaMalloc(void **devPtr, size_t size) {
             data->master_pid = getpid();
             data->allocation_size = size;
 
+            fprintf(stderr,
+                    "[VRAM_HOOK] MASTER cudaMalloc request for shared weights: %.2f MB (%zu bytes)\n",
+                    (double)size / (1024.0 * 1024.0),
+                    size);
+
+            long long master_malloc_t0 = now_ms();
             cudaError_t res = real_cudaMalloc(devPtr, size);
+            long long master_malloc_t1 = now_ms();
+
             if (res != cudaSuccess) {
                 fprintf(stderr,
-                        "[VRAM_HOOK] MASTER cudaMalloc failed: code=%d\n",
-                        (int)res);
+                        "[VRAM_HOOK] MASTER cudaMalloc failed for shared weights: code=%d elapsed=%lld ms\n",
+                        (int)res,
+                        master_malloc_t1 - master_malloc_t0);
 
                 munmap(data, sizeof(ipc_data_t));
                 close(shm_fd);
@@ -649,11 +783,22 @@ cudaError_t cudaMalloc(void **devPtr, size_t size) {
                 return res;
             }
 
+            fprintf(stderr,
+                    "[VRAM_HOOK] MASTER cudaMalloc done for shared weights: %.2f MB (%zu bytes) at %p, elapsed=%lld ms\n",
+                    (double)size / (1024.0 * 1024.0),
+                    size,
+                    *devPtr,
+                    master_malloc_t1 - master_malloc_t0);
+
+            long long get_handle_t0 = now_ms();
             cudaError_t ipc_res = real_cudaIpcGetMemHandle(&data->handle, *devPtr);
+            long long get_handle_t1 = now_ms();
+
             if (ipc_res != cudaSuccess) {
                 fprintf(stderr,
-                        "[VRAM_HOOK] MASTER cudaIpcGetMemHandle failed: code=%d\n",
-                        (int)ipc_res);
+                        "[VRAM_HOOK] MASTER cudaIpcGetMemHandle failed: code=%d elapsed=%lld ms\n",
+                        (int)ipc_res,
+                        get_handle_t1 - get_handle_t0);
 
                 real_cudaFree(*devPtr);
                 *devPtr = NULL;
@@ -666,7 +811,13 @@ cudaError_t cudaMalloc(void **devPtr, size_t size) {
                 return ipc_res;
             }
 
+            fprintf(stderr,
+                    "[VRAM_HOOK] MASTER cudaIpcGetMemHandle done for shared weights: code=%d elapsed=%lld ms\n",
+                    (int)ipc_res,
+                    get_handle_t1 - get_handle_t0);
+
             master_alloc_ptr = *devPtr;
+            master_alloc_size = size;
             is_master_process = true;
             shared_allocation_done = true;
 
@@ -796,36 +947,66 @@ cudaError_t cudaMalloc(void **devPtr, size_t size) {
             return res;
         }
 
+        fprintf(stderr,
+                "[VRAM_HOOK] WORKER cudaIpcOpenMemHandle request for shared weights: %.2f MB (%zu bytes)\n",
+                (double)size / (1024.0 * 1024.0),
+                size);
+
+        long long ipc_open_t0 = now_ms();
         cudaError_t res = real_cudaIpcOpenMemHandle(devPtr,
                                                     data->handle,
                                                     cudaIpcMemLazyEnablePeerAccess);
+        long long ipc_open_t1 = now_ms();
 
         if (res == cudaSuccess) {
             worker_mapped_ptr = *devPtr;
+            worker_mapped_size = size;
             shared_allocation_done = true;
 
             fprintf(stderr,
-                    "[VRAM_HOOK] WORKER: IPC handle mapped at %p. No duplicate weights allocation.\n",
-                    *devPtr);
+                    "[VRAM_HOOK] WORKER cudaIpcOpenMemHandle done for shared weights: %.2f MB (%zu bytes) at %p, code=%d elapsed=%lld ms. No duplicate weights allocation.\n",
+                    (double)size / (1024.0 * 1024.0),
+                    size,
+                    *devPtr,
+                    (int)res,
+                    ipc_open_t1 - ipc_open_t0);
 
             trace_cuda_caller("cudaMalloc(worker-ipc-open)", size, *devPtr, res);
         } else {
             fprintf(stderr,
-                    "[VRAM_HOOK] ERROR: cudaIpcOpenMemHandle failed: code=%d. "
+                    "[VRAM_HOOK] ERROR: cudaIpcOpenMemHandle failed for shared weights: code=%d elapsed=%lld ms. "
                     "Falling back to normal cudaMalloc.\n",
-                    (int)res);
+                    (int)res,
+                    ipc_open_t1 - ipc_open_t0);
 
             /*
              * If IPC open fails, do not crash llama.cpp. Allocate normally.
              * This can happen with stale handles, incompatible devices, or permission issues.
              */
+            fprintf(stderr,
+                    "[VRAM_HOOK] fallback cudaMalloc request for shared weights: %.2f MB (%zu bytes)\n",
+                    (double)size / (1024.0 * 1024.0),
+                    size);
+
+            long long fallback_t0 = now_ms();
             cudaError_t fallback_res = real_cudaMalloc(devPtr, size);
+            long long fallback_t1 = now_ms();
+
             if (fallback_res == cudaSuccess) {
                 shared_allocation_done = true;
                 fprintf(stderr,
-                        "[VRAM_HOOK] fallback cudaMalloc for weights succeeded at %p\n",
-                        *devPtr);
+                        "[VRAM_HOOK] fallback cudaMalloc done for weights: %.2f MB (%zu bytes) at %p, elapsed=%lld ms\n",
+                        (double)size / (1024.0 * 1024.0),
+                        size,
+                        *devPtr,
+                        fallback_t1 - fallback_t0);
                 trace_cuda_caller("cudaMalloc(weights-fallback)", size, *devPtr, fallback_res);
+                res = fallback_res;
+            } else {
+                fprintf(stderr,
+                        "[VRAM_HOOK] fallback cudaMalloc failed for weights: code=%d elapsed=%lld ms\n",
+                        (int)fallback_res,
+                        fallback_t1 - fallback_t0);
                 res = fallback_res;
             }
         }
@@ -838,6 +1019,138 @@ cudaError_t cudaMalloc(void **devPtr, size_t size) {
         in_hook = 0;
         return res;
     }
+}
+
+
+cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, enum cudaMemcpyKind kind) {
+    if (resolve_cuda_symbols() != 0 || !real_cudaMemcpy) {
+        return cudaErrorUnknown;
+    }
+
+    if (skip_worker_weight_uploads && ptr_in_worker_shared_range(dst, count)) {
+        if (log_skipped_weight_uploads) {
+            fprintf(stderr,
+                    "[VRAM_HOOK] WORKER: skipping cudaMemcpy to shared weights dst=%p size=%zu kind=%s(%d)\n",
+                    dst,
+                    count,
+                    cuda_memcpy_kind_name(kind),
+                    (int)kind);
+        }
+        return cudaSuccess;
+    }
+
+    cudaError_t res = real_cudaMemcpy(dst, src, count, kind);
+
+    if (log_memcpy_ops || trace_normal_allocs) {
+        fprintf(stderr,
+                "[VRAM_HOOK] cudaMemcpy dst=%p src=%p size=%zu kind=%s(%d) code=%d\n",
+                dst,
+                src,
+                count,
+                cuda_memcpy_kind_name(kind),
+                (int)kind,
+                (int)res);
+    }
+
+    return res;
+}
+
+cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count,
+                            enum cudaMemcpyKind kind, cudaStream_t stream) {
+    if (resolve_cuda_symbols() != 0 || !real_cudaMemcpyAsync) {
+        return cudaErrorUnknown;
+    }
+
+    if (skip_worker_weight_uploads && ptr_in_worker_shared_range(dst, count)) {
+        if (log_skipped_weight_uploads) {
+            fprintf(stderr,
+                    "[VRAM_HOOK] WORKER: skipping cudaMemcpyAsync to shared weights dst=%p size=%zu kind=%s(%d) stream=%p\n",
+                    dst,
+                    count,
+                    cuda_memcpy_kind_name(kind),
+                    (int)kind,
+                    (void *)stream);
+        }
+        return cudaSuccess;
+    }
+
+    cudaError_t res = real_cudaMemcpyAsync(dst, src, count, kind, stream);
+
+    if (log_memcpy_ops || trace_normal_allocs) {
+        fprintf(stderr,
+                "[VRAM_HOOK] cudaMemcpyAsync dst=%p src=%p size=%zu kind=%s(%d) stream=%p code=%d\n",
+                dst,
+                src,
+                count,
+                cuda_memcpy_kind_name(kind),
+                (int)kind,
+                (void *)stream,
+                (int)res);
+    }
+
+    return res;
+}
+
+cudaError_t cudaMemset(void *devPtr, int value, size_t count) {
+    if (resolve_cuda_symbols() != 0 || !real_cudaMemset) {
+        return cudaErrorUnknown;
+    }
+
+    if (skip_worker_weight_uploads && ptr_in_worker_shared_range(devPtr, count)) {
+        if (log_skipped_weight_uploads) {
+            fprintf(stderr,
+                    "[VRAM_HOOK] WORKER: skipping cudaMemset on shared weights ptr=%p size=%zu value=%d\n",
+                    devPtr,
+                    count,
+                    value);
+        }
+        return cudaSuccess;
+    }
+
+    cudaError_t res = real_cudaMemset(devPtr, value, count);
+
+    if (log_memcpy_ops || trace_normal_allocs) {
+        fprintf(stderr,
+                "[VRAM_HOOK] cudaMemset ptr=%p size=%zu value=%d code=%d\n",
+                devPtr,
+                count,
+                value,
+                (int)res);
+    }
+
+    return res;
+}
+
+cudaError_t cudaMemsetAsync(void *devPtr, int value, size_t count, cudaStream_t stream) {
+    if (resolve_cuda_symbols() != 0 || !real_cudaMemsetAsync) {
+        return cudaErrorUnknown;
+    }
+
+    if (skip_worker_weight_uploads && ptr_in_worker_shared_range(devPtr, count)) {
+        if (log_skipped_weight_uploads) {
+            fprintf(stderr,
+                    "[VRAM_HOOK] WORKER: skipping cudaMemsetAsync on shared weights ptr=%p size=%zu value=%d stream=%p\n",
+                    devPtr,
+                    count,
+                    value,
+                    (void *)stream);
+        }
+        return cudaSuccess;
+    }
+
+    cudaError_t res = real_cudaMemsetAsync(devPtr, value, count, stream);
+
+    if (log_memcpy_ops || trace_normal_allocs) {
+        fprintf(stderr,
+                "[VRAM_HOOK] cudaMemsetAsync ptr=%p size=%zu value=%d stream=%p code=%d\n",
+                devPtr,
+                count,
+                value,
+                (void *)stream,
+                (int)res);
+    }
+
+    return res;
 }
 
 __attribute__((destructor))
